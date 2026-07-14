@@ -124,6 +124,14 @@ SQLPLUS_TIMEOUT="${DG_AUDIT_SQLPLUS_TIMEOUT:-120}"       # seconds, used if `tim
 MEM_WARN_PCT="${DG_AUDIT_MEM_WARN_PCT:-85}"              # node memory usage warn threshold (%)
 MEM_CRIT_PCT="${DG_AUDIT_MEM_CRIT_PCT:-100}"             # node memory usage critical threshold (%)
 
+# How old (in minutes) an extraction is allowed to be before the comparison
+# step refuses to give a clean "in sync"/"mismatch" verdict and instead
+# shows a STALE badge with the actual age. Should be a small multiple of
+# your cron interval (e.g. hourly cron -> 180 = allow up to 3 missed runs
+# before complaining). Applies to spfile extractions, the memory-vs-spfile
+# check, and the node memory summary.
+MAX_DATA_AGE_MINUTES="${DG_AUDIT_MAX_DATA_AGE_MINUTES:-180}"
+
 # pmon processes to exclude from discovery (extended regex, matched against the
 # extracted SID/instance token, e.g. "+ASM1", "-MGMTDB", "APX")
 EXCLUDE_PMON_REGEX="${DG_AUDIT_EXCLUDE_PMON_REGEX:-(^\+ASM)|(^-MGMTDB$)|(APX)}"
@@ -315,6 +323,140 @@ sanitize() {
 }
 
 ############################################
+# ===== DATA FRESHNESS / META TRACKING =====
+# Every extraction (spfile params, memory-vs-spfile, node memory) writes a
+# small ".meta" sidecar recording exactly when it was generated. The
+# comparison step (and the HTML report) use this to make sure a stale file
+# left behind by a broken cron job / downed host never masquerades as
+# current data - a stale side is flagged loudly (age + STALE badge) instead
+# of being silently diffed as if it were fresh.
+#
+# We don't rely purely on filesystem mtime for this: NFS clients/servers,
+# `cp -p` archive copies, and clock differences between hosts can all make
+# mtime a shaky signal on its own. Instead we record the actual wall-clock
+# generation time in the file's own content at write time. Where `date +%s`
+# is available we also record an epoch so exact ages can be computed and
+# thresholds enforced numerically; where it isn't (extremely old Solaris
+# date builds), we fall back to a portable find-based "older than N
+# minutes/days" boolean check, and simply display the human timestamp
+# without a numeric age.
+############################################
+EPOCH_OK=1
+FIND_MMIN_OK=1
+
+detect_time_capabilities() {
+    local e
+    e="$(date +%s 2>/dev/null)"
+    case "${e}" in
+        ''|*[!0-9]*) EPOCH_OK=0 ;;
+        *) EPOCH_OK=1 ;;
+    esac
+
+    local t
+    t="$(mktemp "${BASE_DIR}/.dgaudit_capcheck.XXXXXX" 2>/dev/null)"
+    if [ -n "${t}" ] && [ -f "${t}" ]; then
+        if ! find "${t}" -mmin +0 >/dev/null 2>&1; then
+            FIND_MMIN_OK=0
+        fi
+        rm -f "${t}" 2>/dev/null
+    else
+        FIND_MMIN_OK=0
+    fi
+
+    log INFO "Time capability check: date +%s usable=${EPOCH_OK}, find -mmin usable=${FIND_MMIN_OK}"
+}
+
+# write_meta_file <metafile> <dbname> <dbuname> <role_or_label>
+write_meta_file() {
+    local metafile="$1" dbname="$2" dbuname="$3" label="$4"
+    local epoch="NA"
+    [ "${EPOCH_OK}" = "1" ] && epoch="$(date +%s)"
+    {
+        printf 'DB_NAME=%s\n' "${dbname}"
+        printf 'DB_UNIQUE_NAME=%s\n' "${dbuname}"
+        printf 'LABEL=%s\n' "${label}"
+        printf 'HOST=%s\n' "${HOST_NAME}"
+        printf 'GENERATED_HUMAN=%s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || date)"
+        printf 'GENERATED_EPOCH=%s\n' "${epoch}"
+        printf 'SCRIPT_VERSION=%s\n' "${SCRIPT_VERSION}"
+    } > "${metafile}"
+}
+
+# meta_get <key> <metafile> -> prints value (empty if absent/missing file)
+meta_get() {
+    local key="$1" file="$2"
+    [ -f "${file}" ] || return 0
+    sed -n "s/^${key}=//p" "${file}" 2>/dev/null | head -1
+}
+
+# check_staleness <metafile> [fallback_mtime_file]
+# Sets globals: STALE (0=fresh, 1=stale/unknown), AGE_DESC (human string)
+# Conservative by design: if we can't determine age at all, we treat it as
+# stale rather than silently assuming freshness.
+check_staleness() {
+    local metafile="$1" fallback="${2:-}"
+    STALE=1
+    AGE_DESC="unknown"
+
+    if [ -f "${metafile}" ]; then
+        local epoch human
+        epoch="$(meta_get GENERATED_EPOCH "${metafile}")"
+        human="$(meta_get GENERATED_HUMAN "${metafile}")"
+
+        if [ "${EPOCH_OK}" = "1" ] && [ -n "${epoch}" ] && [ "${epoch}" != "NA" ]; then
+            local now age_min
+            now="$(date +%s)"
+            case "${epoch}" in
+                *[!0-9]*|'') AGE_DESC="${human:-unknown} (unparsable timestamp)"; STALE=1; return 0 ;;
+            esac
+            age_min=$(( (now - epoch) / 60 ))
+            [ "${age_min}" -lt 0 ] && age_min=0
+            if [ "${age_min}" -lt 60 ]; then
+                AGE_DESC="${age_min} min ago (as of ${human})"
+            else
+                AGE_DESC="$(( age_min / 60 ))h $(( age_min % 60 ))m ago (as of ${human})"
+            fi
+            if [ "${age_min}" -gt "${MAX_DATA_AGE_MINUTES}" ]; then
+                STALE=1
+            else
+                STALE=0
+            fi
+            return 0
+        fi
+
+        # No usable epoch - fall back to a portable mtime-based boolean check
+        # against the metafile itself (written at the same time as the data).
+        AGE_DESC="as of ${human:-unknown} (exact age unavailable on this platform)"
+        if [ "${FIND_MMIN_OK}" = "1" ]; then
+            if [ -n "$(find "${metafile}" -mmin "+${MAX_DATA_AGE_MINUTES}" 2>/dev/null)" ]; then
+                STALE=1
+            else
+                STALE=0
+            fi
+        else
+            local days=$(( MAX_DATA_AGE_MINUTES / 1440 ))
+            [ "${days}" -lt 1 ] && days=1
+            if [ -n "$(find "${metafile}" -mtime "+${days}" 2>/dev/null)" ]; then
+                STALE=1
+            else
+                STALE=0
+            fi
+        fi
+        return 0
+    fi
+
+    # No meta file at all (e.g. data left over from before this feature
+    # existed). Try the fallback file's mtime; if that's not available
+    # either, we stay conservative: STALE=1, age unknown.
+    if [ -n "${fallback}" ] && [ -f "${fallback}" ]; then
+        AGE_DESC="unknown (no metadata - legacy or corrupted extraction)"
+        if [ "${FIND_MMIN_OK}" = "1" ]; then
+            [ -z "$(find "${fallback}" -mmin "+${MAX_DATA_AGE_MINUTES}" 2>/dev/null)" ] && STALE=0
+        fi
+    fi
+}
+
+############################################
 # ===== SQL SCRIPT GENERATION ==============
 # All queries use ONLY fixed (V$) views so the identical SQL works on a
 # mounted/read-only standby as well as an open primary. Heredocs below use a
@@ -472,7 +614,7 @@ purge_stale_role_files() {
     local other="STANDBY"
     [ "${role}" = "STANDBY" ] && other="PRIMARY"
     local pat="${LATEST_DIR}/${dbn}__${dbu}__${other}"
-    rm -f "${pat}.spfile.csv" "${pat}.spfile.raw" 2>/dev/null
+    rm -f "${pat}.spfile.csv" "${pat}.spfile.raw" "${pat}.meta" 2>/dev/null
 }
 
 ############################################
@@ -570,8 +712,11 @@ EOF2
         pcount="$(wc -l < "${raw_file}" | tr -d ' ')"
         log INFO "SID ${sid} (${role_norm}): ${pcount} explicit spfile parameters written to ${csv_file}"
 
+        write_meta_file "${LATEST_DIR}/${dbn_s}__${dbu_s}__${role_norm}.meta" "${dbname}" "${dbuname}" "${role_norm}"
+
         cp -f "${csv_file}" "${THIS_RUN_ARCHIVE}/" 2>/dev/null
         cp -f "${raw_file}" "${THIS_RUN_ARCHIVE}/" 2>/dev/null
+        cp -f "${LATEST_DIR}/${dbn_s}__${dbu_s}__${role_norm}.meta" "${THIS_RUN_ARCHIVE}/" 2>/dev/null
     fi
 
     # ---- Part 2: memory vs spfile + node memory data collection (PRIMARY only) ----
@@ -625,6 +770,7 @@ compute_memory_vs_spfile() {
     else
         log INFO "SID ${sid}: no live-vs-spfile memory drift detected"
     fi
+    write_meta_file "${LATEST_DIR}/${dbu_s}.memory_vs_spfile.meta" "${dbn_s}" "${dbu_s}" "MEMORY_VS_SPFILE"
     cp -f "${csv_file}" "${THIS_RUN_ARCHIVE}/" 2>/dev/null
 
     # ---- collect this instance's configured memory footprint for node-level rollup ----
@@ -718,6 +864,7 @@ compute_node_memory_summary() {
     } >> "${csv_file}"
 
     log INFO "Node memory summary for ${HOST_NAME}: configured=${total_configured} bytes, physical=${phys_bytes} bytes, ${pct}% (${status})"
+    write_meta_file "${LATEST_DIR}/host__${host_s}.node_memory.meta" "N/A" "${host_s}" "NODE_MEMORY"
     cp -f "${csv_file}" "${THIS_RUN_ARCHIVE}/" 2>/dev/null
 }
 
@@ -748,14 +895,38 @@ compare_db() {
         pfile="$(ls -t ${primfiles} | head -1)"
     fi
 
+    # ---- Freshness check: never let a stale side masquerade as current ----
+    local compare_meta_csv="${LATEST_DIR}/${dbn_s}.compare_meta.csv"
+    local compare_meta_tmp
+    compare_meta_tmp="$(mk_tmp)"
+    echo "SIDE,DB_UNIQUE_NAME,AGE_DESCRIPTION,STALE,MAX_AGE_MINUTES" > "${compare_meta_tmp}"
+
+    local pmeta pdbu any_stale=0
+    pmeta="$(printf '%s' "${pfile}" | sed 's/\.spfile\.raw$/.meta/')"
+    pdbu="$(basename "${pfile}" | "${AWK_BIN}" -F'__' '{print $2}')"
+    check_staleness "${pmeta}" "${pfile}"
+    printf '"PRIMARY","%s","%s","%s","%s"\n' "${pdbu}" "${AGE_DESC}" "$( [ "${STALE}" = "1" ] && echo YES || echo NO )" "${MAX_DATA_AGE_MINUTES}" >> "${compare_meta_tmp}"
+    if [ "${STALE}" = "1" ]; then
+        any_stale=1
+        log WARN "DB '${dbn_s}': PRIMARY extraction (${pdbu}) is STALE - ${AGE_DESC} (threshold ${MAX_DATA_AGE_MINUTES} min). Comparison will be flagged, not trusted as current."
+    fi
+
     local mismatch_csv="${LATEST_DIR}/${dbn_s}.mismatch.csv"
     local mismatch_tmp
     mismatch_tmp="$(mk_tmp)"
     echo "DB_NAME,STANDBY_DB_UNIQUE_NAME,PDB_NAME,PARAMETER_NAME,PRIMARY_VALUE,STANDBY_VALUE" > "${mismatch_tmp}"
 
-    local sfile sdbu
+    local sfile sdbu smeta
     for sfile in ${standbyfiles}; do
         sdbu="$(basename "${sfile}" | "${AWK_BIN}" -F'__' '{print $2}')"
+        smeta="$(printf '%s' "${sfile}" | sed 's/\.spfile\.raw$/.meta/')"
+        check_staleness "${smeta}" "${sfile}"
+        printf '"STANDBY","%s","%s","%s","%s"\n' "${sdbu}" "${AGE_DESC}" "$( [ "${STALE}" = "1" ] && echo YES || echo NO )" "${MAX_DATA_AGE_MINUTES}" >> "${compare_meta_tmp}"
+        if [ "${STALE}" = "1" ]; then
+            any_stale=1
+            log WARN "DB '${dbn_s}': STANDBY extraction (${sdbu}) is STALE - ${AGE_DESC} (threshold ${MAX_DATA_AGE_MINUTES} min). Comparison will be flagged, not trusted as current."
+        fi
+
         "${AWK_BIN}" -F'|' -v excl="${EXCLUDE_PARAMS_REGEX}" -v dbn="${dbn_s}" -v sdbu="${sdbu}" '
             FNR==NR { pkey=$2"|"$3; pval[pkey]=$4; pseen[pkey]=1; next }
             { skey=$2"|"$3; sval[skey]=$4; sseen[skey]=1 }
@@ -777,11 +948,16 @@ compare_db() {
         ' "${pfile}" "${sfile}" >> "${mismatch_tmp}"
     done
 
+    mv -f "${compare_meta_tmp}" "${compare_meta_csv}"
     mv -f "${mismatch_tmp}" "${mismatch_csv}"
     local cnt
     cnt="$(( $(wc -l < "${mismatch_csv}" | tr -d ' ') - 1 ))"
-    log INFO "DB '${dbn_s}': parameter comparison complete - ${cnt} mismatch row(s) written to ${mismatch_csv}"
-    cp -f "${mismatch_csv}" "${THIS_RUN_ARCHIVE}/" 2>/dev/null
+    if [ "${any_stale}" = "1" ]; then
+        log WARN "DB '${dbn_s}': parameter comparison completed against STALE data (${cnt} mismatch row(s)) - see ${compare_meta_csv} for exact ages. Treat this result as informational only until fresh data is available."
+    else
+        log INFO "DB '${dbn_s}': parameter comparison complete - ${cnt} mismatch row(s) written to ${mismatch_csv} (both sides fresh)"
+    fi
+    cp -f "${mismatch_csv}" "${compare_meta_csv}" "${THIS_RUN_ARCHIVE}/" 2>/dev/null
 }
 
 ############################################
@@ -866,7 +1042,7 @@ generate_html_report() {
     local all_dbnames
     all_dbnames="$(printf '%s\n%s\n' "$(for d in ${dbnames_unique}; do sanitize "${d}"; done)" "${existing_dbnames}" | sed '/^$/d' | sort -u)"
 
-    local total_mismatch=0 total_drift=0 total_node_warn=0 db_count=0
+    local total_mismatch=0 total_drift=0 total_node_warn=0 total_stale=0 db_count=0
 
     {
         cat <<'HTML_HEAD'
@@ -984,10 +1160,11 @@ HTML_HEAD
             [ -z "${dbn}" ] && continue
             db_count=$(( db_count + 1 ))
 
-            local prim_csv standby_csv_list mismatch_csv
+            local prim_csv standby_csv_list mismatch_csv compare_meta_csv
             prim_csv="$(ls "${LATEST_DIR}/${dbn}__"*"__PRIMARY.spfile.csv" 2>/dev/null | head -1)"
             standby_csv_list="$(ls "${LATEST_DIR}/${dbn}__"*"__STANDBY.spfile.csv" 2>/dev/null)"
             mismatch_csv="${LATEST_DIR}/${dbn}.mismatch.csv"
+            compare_meta_csv="${LATEST_DIR}/${dbn}.compare_meta.csv"
 
             local prim_dbu=""
             if [ -n "${prim_csv}" ]; then
@@ -998,9 +1175,33 @@ HTML_HEAD
             [ -f "${mismatch_csv}" ] && mismatch_count="$(csv_row_count "${mismatch_csv}")"
             total_mismatch=$(( total_mismatch + mismatch_count ))
 
+            # ---- Freshness: read back what compare_db() recorded, never trust
+            # the mismatch/in-sync verdict without checking data age first ----
+            local db_any_stale=0
+            local prim_age_desc="" standby_age_lines=""
+            if [ -f "${compare_meta_csv}" ]; then
+                prim_age_desc="$("${AWK_BIN}" -F',' '
+                    $1=="\"PRIMARY\""{
+                        gsub(/"/,"")
+                        printf "%s%s", $3, ($4=="YES" ? " [STALE]" : "")
+                    }' "${compare_meta_csv}")"
+
+                # NOTE: do not "exit 0" inside the main body here - awk always
+                # runs END after exit, and an exit inside END overrides an
+                # earlier one, which previously made this check always report
+                # "not stale" regardless of the data. Use a flag instead.
+                if "${AWK_BIN}" -F',' 'NR>1{gsub(/"/,"");if($4=="YES"){f=1}} END{exit (f?0:1)}' "${compare_meta_csv}"; then
+                    db_any_stale=1
+                fi
+                standby_age_lines="$("${AWK_BIN}" -F',' 'NR>1 && $1=="\"STANDBY\""{gsub(/"/,"");printf "%s: %s%s; ", $2, $3, ($4=="YES"?" [STALE]":"")}' "${compare_meta_csv}")"
+            fi
+            [ "${db_any_stale}" = "1" ] && total_stale=$(( total_stale + 1 ))
+
             local badge_class="info" badge_text="INFO"
             if [ -z "${prim_csv}" ] || [ -z "${standby_csv_list}" ]; then
                 badge_class="warn"; badge_text="AWAITING PEER"
+            elif [ "${db_any_stale}" = "1" ]; then
+                badge_class="warn"; badge_text="STALE DATA"
             elif [ "${mismatch_count}" -gt 0 ]; then
                 badge_class="bad"; badge_text="${mismatch_count} MISMATCH"
             else
@@ -1015,25 +1216,40 @@ HTML_HEAD
                 "$( [ -n "${standby_csv_list}" ] && echo " &middot; standby(s) present" || echo " &middot; no standby data yet" )"
             echo '  <div class="body">'
 
+            if [ -n "${prim_csv}" ] && [ -n "${standby_csv_list}" ] && [ -f "${compare_meta_csv}" ]; then
+                echo '    <p class="empty-note" style="font-size:12px;">'
+                printf 'Primary (%s) %s &middot; Standby data: %s' "${prim_dbu}" "${prim_age_desc:-unknown}" "${standby_age_lines:-unknown}"
+                echo '    </p>'
+            fi
+
             echo '    <section class="subsection"><h3>Primary vs Standby Parameter Mismatches</h3>'
             if [ -z "${prim_csv}" ] || [ -z "${standby_csv_list}" ]; then
                 echo '<p class="pending-note">Waiting for both primary and standby extractions to be present before comparing.</p>'
-            elif [ "${mismatch_count}" -eq 0 ]; then
-                echo '<p class="empty-note">No mismatches - all comparable parameters match.</p>'
             else
-                echo '<table class="filter-table"><thead></thead><tbody>'
-                csv_to_html_rows "${mismatch_csv}" "__ALLBAD__"
-                echo '</tbody></table>'
+                if [ "${db_any_stale}" = "1" ]; then
+                    printf '<p class="pending-note">&#9888; One or more sides of this comparison exceed the freshness threshold (%s min). The result below may not reflect the current state - treat it as informational only until both sides refresh. See ages above.</p>\n' "${MAX_DATA_AGE_MINUTES}"
+                fi
+                if [ "${mismatch_count}" -eq 0 ]; then
+                    echo '<p class="empty-note">No mismatches - all comparable parameters match.</p>'
+                else
+                    echo '<table class="filter-table"><thead></thead><tbody>'
+                    csv_to_html_rows "${mismatch_csv}" "__ALLBAD__"
+                    echo '</tbody></table>'
+                fi
             fi
             echo '    </section>'
 
-            local memcsv_path
+            local memcsv_path memmeta_path mem_age_desc=""
             memcsv_path="$(ls "${LATEST_DIR}/${prim_dbu}.memory_vs_spfile.csv" 2>/dev/null | head -1)"
+            memmeta_path="${LATEST_DIR}/${prim_dbu}.memory_vs_spfile.meta"
             if [ -n "${prim_dbu}" ] && [ -f "${memcsv_path}" ]; then
                 local dcount
                 dcount="$("${AWK_BIN}" -F',' 'NR>1 && $0 ~ /"DRIFT"/{c++} END{print c+0}' "${memcsv_path}")"
                 total_drift=$(( total_drift + dcount ))
+                check_staleness "${memmeta_path}" "${memcsv_path}"
+                mem_age_desc="${AGE_DESC}"
                 echo '    <section class="subsection"><h3>Primary: Live Memory vs SPFILE (drift detection)</h3>'
+                printf '<p class="empty-note" style="font-size:12px;">%s%s</p>\n' "${mem_age_desc}" "$( [ "${STALE}" = "1" ] && echo ' &mdash; <b style="color:var(--warn);">STALE, exceeds freshness threshold</b>' || echo '' )"
                 echo '<table class="filter-table"><thead></thead><tbody>'
                 csv_to_html_rows "${memcsv_path}" "STATUS"
                 echo '</tbody></table>'
@@ -1075,13 +1291,14 @@ HTML_HEAD
 
         cat <<HTML_TAIL
 <script>
-  var STATS = { dbCount: ${db_count}, mismatches: ${total_mismatch}, memDrift: ${total_drift}, nodeWarn: ${total_node_warn} };
+  var STATS = { dbCount: ${db_count}, mismatches: ${total_mismatch}, memDrift: ${total_drift}, nodeWarn: ${total_node_warn}, staleDbs: ${total_stale} };
   function renderStats() {
     var strip = document.getElementById('summary-strip');
     if (!strip) return;
     var cards = [
       { label: 'Databases Audited', val: STATS.dbCount, cls: 'info' },
       { label: 'Parameter Mismatches', val: STATS.mismatches, cls: (STATS.mismatches > 0 ? 'bad' : 'ok') },
+      { label: 'Stale Data Warnings', val: STATS.staleDbs, cls: (STATS.staleDbs > 0 ? 'warn' : 'ok') },
       { label: 'Memory Drift Findings', val: STATS.memDrift, cls: (STATS.memDrift > 0 ? 'warn' : 'ok') },
       { label: 'Node Memory Warnings', val: STATS.nodeWarn, cls: (STATS.nodeWarn > 0 ? 'bad' : 'ok') }
     ];
@@ -1123,6 +1340,7 @@ HTML_TAIL
     RPT_MISMATCH_COUNT="${total_mismatch}"
     RPT_DRIFT_COUNT="${total_drift}"
     RPT_NODE_WARN_COUNT="${total_node_warn}"
+    RPT_STALE_COUNT="${total_stale}"
 }
 
 ############################################
@@ -1140,7 +1358,7 @@ send_report_email() {
     fi
 
     local subject
-    subject="${EMAIL_SUBJECT_PREFIX} ${RPT_DB_COUNT:-0} DB(s), ${RPT_MISMATCH_COUNT:-0} mismatch(es), ${RPT_DRIFT_COUNT:-0} memory drift - $(date '+%Y-%m-%d %H:%M')"
+    subject="${EMAIL_SUBJECT_PREFIX} ${RPT_DB_COUNT:-0} DB(s), ${RPT_MISMATCH_COUNT:-0} mismatch(es), ${RPT_STALE_COUNT:-0} stale, ${RPT_DRIFT_COUNT:-0} memory drift - $(date '+%Y-%m-%d %H:%M')"
 
     local boundary="dgaudit_$(date +%s)_$$"
     local msg_file
@@ -1164,6 +1382,8 @@ send_report_email() {
         printf '<tr style="background:#eef2ff;"><td><b>Databases audited</b></td><td>%s</td></tr>' "${RPT_DB_COUNT:-0}"
         printf '<tr style="background:%s;"><td><b>Parameter mismatches</b></td><td>%s</td></tr>' \
             "$( [ "${RPT_MISMATCH_COUNT:-0}" -gt 0 ] && echo '#fee2e2' || echo '#dcfce7' )" "${RPT_MISMATCH_COUNT:-0}"
+        printf '<tr style="background:%s;"><td><b>Stale data warnings</b></td><td>%s</td></tr>' \
+            "$( [ "${RPT_STALE_COUNT:-0}" -gt 0 ] && echo '#fef3c7' || echo '#dcfce7' )" "${RPT_STALE_COUNT:-0}"
         printf '<tr style="background:%s;"><td><b>Memory drift findings</b></td><td>%s</td></tr>' \
             "$( [ "${RPT_DRIFT_COUNT:-0}" -gt 0 ] && echo '#fef3c7' || echo '#dcfce7' )" "${RPT_DRIFT_COUNT:-0}"
         printf '<tr style="background:%s;"><td><b>Node memory warnings</b></td><td>%s</td></tr>' \
@@ -1254,6 +1474,7 @@ main() {
     log INFO "===== Starting ${SCRIPT_NAME} v${SCRIPT_VERSION} on ${HOST_NAME} (${OS_NAME}) at ${SCRIPT_START_EPOCH_HUMAN} ====="
     acquire_lock
     check_prereqs
+    detect_time_capabilities
     write_sql_scripts
     init_run_state
 
