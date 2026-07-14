@@ -1422,8 +1422,26 @@ send_report_email() {
     fi
 
     if command -v mailx >/dev/null 2>&1; then
-        if command -v mailx >/dev/null 2>&1 && mailx -a "${html_file}" -s "${subject}" "${EMAIL_TO}" < /dev/null 2>/dev/null; then
-            log WARN "Sent via mailx fallback (plain, attachment support varies by platform - HTML body not guaranteed)."
+        local plain_summary
+        plain_summary="$(mk_tmp)"
+        {
+            printf 'Oracle Data Guard Parameter Audit Summary\n'
+            printf 'Host: %s\n' "${HOST_NAME}"
+            printf 'Generated: %s\n\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+            printf 'Databases audited:      %s\n' "${RPT_DB_COUNT:-0}"
+            printf 'Parameter mismatches:   %s\n' "${RPT_MISMATCH_COUNT:-0}"
+            printf 'Stale data warnings:    %s\n' "${RPT_STALE_COUNT:-0}"
+            printf 'Memory drift findings:  %s\n' "${RPT_DRIFT_COUNT:-0}"
+            printf 'Node memory warnings:   %s\n\n' "${RPT_NODE_WARN_COUNT:-0}"
+            printf 'Full interactive dashboard is attached - open it in a browser.\n'
+            printf '(mailx fallback in use: sendmail was unavailable or failed, so this\n'
+            printf 'is a plain-text summary rather than the styled HTML body; the\n'
+            printf 'attachment itself is unaffected.)\n'
+            printf '%s v%s - report path: %s\n' "${SCRIPT_NAME}" "${SCRIPT_VERSION}" "${LATEST_DIR}"
+        } > "${plain_summary}"
+
+        if mailx -a "${html_file}" -s "${subject}" "${EMAIL_TO}" < "${plain_summary}" 2>/dev/null; then
+            log WARN "Sent via mailx fallback (plain-text summary body, HTML dashboard attached - attachment support varies by platform)."
             return 0
         fi
     fi
